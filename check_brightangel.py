@@ -25,7 +25,7 @@ AVAILABILITY_URL = (
 GROUP_SIZE = 2
 
 TARGET_CAMPGROUNDS = ["CBG - Bright Angel Campground", "CIG - Havasupai Gardens Campground"]
-TARGET_DATES = ["Sunday, March 22, 2026", "Monday, March 23, 2026", "Friday, March 27, 2026"]
+TARGET_DATES = ["Sunday, March 22, 2026", "Monday, March 23, 2026"]
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
