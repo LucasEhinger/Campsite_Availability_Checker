@@ -58,6 +58,32 @@ USER_AGENT = (
 )
 
 
+def describe_email_env():
+    """Report the shape of the mail secrets without revealing them.
+
+    Log output is readable by anyone who can see the repo, so this prints
+    only lengths and shape checks -- never the values themselves.
+    """
+    print("Mail settings:")
+    for name in ("SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"):
+        raw = os.environ.get(name)
+        if not raw:
+            print(f"  {name}: MISSING")
+            continue
+        notes = []
+        if raw != raw.strip():
+            notes.append("HAS SURROUNDING WHITESPACE (likely the problem)")
+        if name == "SENDGRID_API_KEY":
+            notes.append("starts with 'SG.'" if raw.startswith("SG.")
+                         else "does NOT start with 'SG.' (not a SendGrid key?)")
+            if len(raw.strip()) < 50:
+                notes.append("suspiciously short for a SendGrid key")
+        else:
+            notes.append("looks like an address" if "@" in raw and "." in raw.split("@")[-1]
+                         else "does NOT look like an email address")
+        print(f"  {name}: {len(raw)} chars, " + ", ".join(notes))
+
+
 def send_email(subject, html):
     """Send via SendGrid. Raises on any failure so CI turns red."""
     from sendgrid import SendGridAPIClient
@@ -77,6 +103,11 @@ def send_email(subject, html):
     try:
         response = SendGridAPIClient(os.environ["SENDGRID_API_KEY"]).send(mail)
     except Exception as exc:
+        body = getattr(exc, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = body.decode("utf-8", "replace")
+        if body:
+            print(f"SendGrid said: {body}")
         hint = ""
         if "401" in str(exc):
             hint = ("\n  -> The SENDGRID_API_KEY is invalid, revoked, or expired. Make a new"
@@ -175,7 +206,8 @@ def main():
 
     if args.test_email:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print("Sending test email...")
+        describe_email_env()
+        print("\nSending test email...")
         send_email(
             "Peddocks alert test -- delivery is working",
             f"<strong>This is a test.</strong><br><br>Your Peddocks Island watcher "
