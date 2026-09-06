@@ -84,6 +84,35 @@ def describe_email_env():
         print(f"  {name}: {len(raw)} chars, " + ", ".join(notes))
 
 
+def probe_sendgrid_key():
+    """Ask SendGrid what this key can do -- distinguishes a dead key from a
+    live key that merely lacks Mail Send permission."""
+    import urllib.error
+    import urllib.request
+
+    key = os.environ.get("SENDGRID_API_KEY", "").strip()
+    if not key:
+        return
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/scopes",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        scopes = payload.get("scopes", [])
+        print(f"  key probe: HTTP {resp.status} -- key is VALID, {len(scopes)} scope(s)")
+        print(f"  mail.send permission: {'YES' if 'mail.send' in scopes else 'NO -- this is the problem'}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        print(f"  key probe: HTTP {exc.code} -- {detail or '(empty body)'}")
+        if exc.code == 401:
+            print("  => SendGrid does not recognize this key at all: it was revoked/"
+                  "deleted, or the account is suspended.")
+    except Exception as exc:
+        print(f"  key probe: could not reach SendGrid ({exc})")
+
+
 def send_email(subject, html):
     """Send via SendGrid. Raises on any failure so CI turns red."""
     from sendgrid import SendGridAPIClient
@@ -207,6 +236,7 @@ def main():
     if args.test_email:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         describe_email_env()
+        probe_sendgrid_key()
         print("\nSending test email...")
         send_email(
             "Peddocks alert test -- delivery is working",
