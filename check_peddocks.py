@@ -58,29 +58,48 @@ USER_AGENT = (
 )
 
 
+def mail_backend():
+    """SMTP wins when configured; SendGrid stays as a fallback."""
+    if os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASS"):
+        return "smtp"
+    if os.environ.get("SENDGRID_API_KEY"):
+        return "sendgrid"
+    return None
+
+
 def describe_email_env():
     """Report the shape of the mail secrets without revealing them.
 
     Log output is readable by anyone who can see the repo, so this prints
     only lengths and shape checks -- never the values themselves.
     """
-    print("Mail settings:")
-    for name in ("SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"):
+    backend = mail_backend()
+    print(f"Mail backend: {backend or 'NONE CONFIGURED'}")
+    names = (["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "TO_EMAIL"]
+             if backend == "smtp"
+             else ["SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL"])
+    for name in names:
         raw = os.environ.get(name)
         if not raw:
-            print(f"  {name}: MISSING")
+            default = {"SMTP_HOST": "smtp.gmail.com", "SMTP_PORT": "587"}.get(name)
+            print(f"  {name}: not set" + (f" (defaulting to {default})" if default else ""))
             continue
         notes = []
         if raw != raw.strip():
             notes.append("HAS SURROUNDING WHITESPACE (likely the problem)")
-        if name == "SENDGRID_API_KEY":
+        if name == "SMTP_PASS":
+            stripped = raw.replace(" ", "").strip()
+            notes.append(f"{len(stripped)} chars once spaces are removed")
+            if len(stripped) != 16:
+                notes.append("NOTE: a Gmail app password is 16 characters")
+        elif name == "SENDGRID_API_KEY":
             notes.append("starts with 'SG.'" if raw.startswith("SG.")
-                         else "does NOT start with 'SG.' (not a SendGrid key?)")
-            if len(raw.strip()) < 50:
-                notes.append("suspiciously short for a SendGrid key")
-        else:
+                         else "does NOT start with 'SG.'")
+        elif name in ("FROM_EMAIL", "TO_EMAIL", "SMTP_USER"):
             notes.append("looks like an address" if "@" in raw and "." in raw.split("@")[-1]
                          else "does NOT look like an email address")
+        else:
+            notes.append(raw)
         print(f"  {name}: {len(raw)} chars, " + ", ".join(notes))
 
 
@@ -91,7 +110,7 @@ def probe_sendgrid_key():
     import urllib.request
 
     key = os.environ.get("SENDGRID_API_KEY", "").strip()
-    if not key:
+    if not key or mail_backend() != "sendgrid":
         return
     req = urllib.request.Request(
         "https://api.sendgrid.com/v3/scopes",
@@ -106,22 +125,53 @@ def probe_sendgrid_key():
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
         print(f"  key probe: HTTP {exc.code} -- {detail or '(empty body)'}")
-        if exc.code == 401:
-            print("  => SendGrid does not recognize this key at all: it was revoked/"
-                  "deleted, or the account is suspended.")
     except Exception as exc:
         print(f"  key probe: could not reach SendGrid ({exc})")
 
 
-def send_email(subject, html):
-    """Send via SendGrid. Raises on any failure so CI turns red."""
+def _send_via_smtp(subject, html):
+    """Send through any SMTP provider. Defaults to Gmail."""
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+    port = int(os.environ.get("SMTP_PORT", "587").strip() or 587)
+    user = os.environ["SMTP_USER"].strip()
+    # Google displays app passwords in groups of four; the spaces are cosmetic.
+    password = os.environ["SMTP_PASS"].replace(" ", "").strip()
+    recipient = (os.environ.get("TO_EMAIL") or user).strip()
+    # Gmail rewrites (or rejects) a From that isn't the authenticated account.
+    sender = user if "gmail" in host else (os.environ.get("FROM_EMAIL") or user).strip()
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content("Peddocks Island availability alert -- view in HTML.")
+    message.add_alternative(html, subtype="html")
+
+    try:
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(user, password)
+            server.send_message(message)
+    except smtplib.SMTPAuthenticationError as exc:
+        raise RuntimeError(
+            f"SMTP login rejected by {host}: {exc}\n"
+            "  -> For Gmail this must be a 16-character App Password, not your\n"
+            "     normal password, and 2-Step Verification must be on.\n"
+            "     Create one at https://myaccount.google.com/apppasswords\n"
+            "     then run: gh secret set SMTP_PASS"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"SMTP send via {host}:{port} failed: {exc}") from exc
+    print(f"Email sent to {recipient} via {host}.")
+
+
+def _send_via_sendgrid(subject, html):
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
-
-    missing = [k for k in ("SENDGRID_API_KEY", "FROM_EMAIL", "TO_EMAIL")
-               if not os.environ.get(k)]
-    if missing:
-        raise RuntimeError(f"Missing environment variable(s): {', '.join(missing)}")
 
     mail = Mail(
         from_email=os.environ["FROM_EMAIL"],
@@ -138,19 +188,32 @@ def send_email(subject, html):
         if body:
             print(f"SendGrid said: {body}")
         hint = ""
-        if "401" in str(exc):
-            hint = ("\n  -> The SENDGRID_API_KEY is invalid, revoked, or expired. Make a new"
-                    "\n     key with 'Mail Send' permission at https://app.sendgrid.com/settings/api_keys"
-                    "\n     then run: gh secret set SENDGRID_API_KEY")
+        if body and "credits" in str(body).lower():
+            hint = ("\n  -> The SendGrid account is out of sending credits (expired trial).\n"
+                    "     Switch to SMTP by setting SMTP_USER and SMTP_PASS.")
+        elif "401" in str(exc):
+            hint = "\n  -> SENDGRID_API_KEY is invalid or revoked."
         elif "403" in str(exc):
-            hint = ("\n  -> SendGrid refused the sender. Verify FROM_EMAIL as a Single Sender"
-                    "\n     at https://app.sendgrid.com/settings/sender_auth")
+            hint = "\n  -> Verify FROM_EMAIL as a Single Sender in SendGrid."
         raise RuntimeError(f"SendGrid send failed: {exc}{hint}") from exc
     if not 200 <= response.status_code < 300:
         raise RuntimeError(
             f"SendGrid rejected the message: HTTP {response.status_code} {response.body}"
         )
     print(f"Email sent to {os.environ['TO_EMAIL']}! Status code: {response.status_code}")
+
+
+def send_email(subject, html):
+    """Send the alert through whichever backend is configured."""
+    backend = mail_backend()
+    if backend == "smtp":
+        return _send_via_smtp(subject, html)
+    if backend == "sendgrid":
+        return _send_via_sendgrid(subject, html)
+    raise RuntimeError(
+        "No mail backend configured. Set SMTP_USER + SMTP_PASS (recommended), "
+        "or SENDGRID_API_KEY + FROM_EMAIL + TO_EMAIL."
+    )
 
 
 def load_state(path):
