@@ -1,22 +1,6 @@
-import os
-
-SENDGRID_API_KEY = os.environ["SENDGRID_API_KEY"]
-FROM_EMAIL = os.environ["FROM_EMAIL"]
-TO_EMAIL = os.environ["TO_EMAIL"]
-
 from playwright.sync_api import sync_playwright
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
 
-def send_availability_email(subject, message):
-    mail = Mail(from_email=FROM_EMAIL, to_emails=TO_EMAIL, subject=subject, html_content=message)
-    try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(mail)
-        print(f"Email sent! Status code: {response.status_code}")
-    except Exception as e:
-        print(f"Error sending email: {e}")
-
+from mailer import send_email
 
 AVAILABILITY_URL = (
     "https://www.recreation.gov/permits/4675337/"
@@ -128,7 +112,7 @@ with sync_playwright() as p:
 
     if availability_found:
         print("\nAVAILABILITY\n")
-        send_availability_email(
+        send_email(
             "Grand Canyon Campsite Available!",
             "<strong>CBG or CIG has available sites on March 22 or 23!</strong><br><br><a href='https://www.recreation.gov/permits/4675337/registration/detailed-availability?date=2026-03-19'>Check availability here</a>",
         )
