@@ -100,8 +100,9 @@ def send_email(subject, html):
             "Set them with: gh secret set SMTP_USER / gh secret set SMTP_PASS"
         )
 
-    host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
-    port = int(os.environ.get("SMTP_PORT", "587").strip() or 587)
+    # An unset GitHub secret arrives as "", so `or` rather than a get() default.
+    host = (os.environ.get("SMTP_HOST") or "smtp.gmail.com").strip()
+    port = int((os.environ.get("SMTP_PORT") or "587").strip())
     user = os.environ["SMTP_USER"].strip()
     # Google displays app passwords in groups of four; the spaces are cosmetic.
     password = os.environ["SMTP_PASS"].replace(" ", "").strip()
