@@ -5,7 +5,12 @@ on:
     # Every 20 min, 5:00am-10:59pm Eastern (EDT, UTC-4).
     # UTC hours 9-23 and 0-2 == 05:00-22:59 local; quiet 11pm-5am.
     - cron: '*/20 0-2,9-23 * * *'
-  workflow_dispatch:  # allows manual run
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: 'Send a test email instead of checking availability'
+        type: boolean
+        default: false
 
 jobs:
   check_availability:
@@ -14,12 +19,23 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # Carries the "already emailed" list between runs so the same opening
+      # doesn't alert twice. Key is unique per run; restore-keys pulls the
+      # most recent previous save.
+      - name: Restore alert history
+        uses: actions/cache@v4
+        with:
+          path: .peddocks_state.json
+          key: peddocks-state-${{ github.run_id }}
+          restore-keys: |
+            peddocks-state-
 
       - name: Install dependencies
         run: |
@@ -33,4 +49,8 @@ jobs:
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
         run: |
-          python check_peddocks.py
+          if [ "${{ inputs.test_email }}" = "true" ]; then
+            python check_peddocks.py --test-email
+          else
+            python check_peddocks.py
+          fi
