@@ -74,7 +74,18 @@ def send_email(subject, html):
         subject=subject,
         html_content=html,
     )
-    response = SendGridAPIClient(os.environ["SENDGRID_API_KEY"]).send(mail)
+    try:
+        response = SendGridAPIClient(os.environ["SENDGRID_API_KEY"]).send(mail)
+    except Exception as exc:
+        hint = ""
+        if "401" in str(exc):
+            hint = ("\n  -> The SENDGRID_API_KEY is invalid, revoked, or expired. Make a new"
+                    "\n     key with 'Mail Send' permission at https://app.sendgrid.com/settings/api_keys"
+                    "\n     then run: gh secret set SENDGRID_API_KEY")
+        elif "403" in str(exc):
+            hint = ("\n  -> SendGrid refused the sender. Verify FROM_EMAIL as a Single Sender"
+                    "\n     at https://app.sendgrid.com/settings/sender_auth")
+        raise RuntimeError(f"SendGrid send failed: {exc}{hint}") from exc
     if not 200 <= response.status_code < 300:
         raise RuntimeError(
             f"SendGrid rejected the message: HTTP {response.status_code} {response.body}"
