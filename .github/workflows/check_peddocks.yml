@@ -2,9 +2,14 @@ name: Check Peddocks Island Campsites
 
 on:
   schedule:
-    # Every 20 min, 5:00am-10:59pm Eastern (EDT, UTC-4).
-    # UTC hours 9-23 and 0-2 == 05:00-22:59 local; quiet 11pm-5am.
-    - cron: '*/20 0-2,9-23 * * *'
+    # These are only "start a watcher if one isn't already running" pokes --
+    # the checks themselves happen inside the run, on the script's own timer.
+    # GitHub's scheduler is best-effort and silently drops slots under load
+    # (only ~15% of ours ever fired), so the run can't depend on it firing
+    # every 20 minutes. Minutes avoid :00, which GitHub names as its peak
+    # congestion moment. The UTC hours cover 5am-11pm Eastern in both EDT and
+    # EST; check_peddocks.py enforces the real local window.
+    - cron: '5,25,45 0-4,9-23 * * *'
   workflow_dispatch:
     inputs:
       test_email:
@@ -12,10 +17,21 @@ on:
         type: boolean
         default: false
 
+# One watcher at a time. A run triggered while another is polling waits its
+# turn instead of piling up, then starts the moment that one exits -- so
+# coverage carries over even though most cron slots never fire.
+# cancel-in-progress must stay false: cancelling would kill the running
+# watcher before the cache step saves, losing the "already emailed" list.
+concurrency:
+  group: peddocks-watcher
+  cancel-in-progress: false
+
 jobs:
   check_availability:
     runs-on: ubuntu-latest
-    timeout-minutes: 5  # cap runaway runs so billing stays ~1 min/run
+    # The watcher polls for --max-minutes (330) and needs room to finish and
+    # save its cache; GitHub's ceiling for a hosted job is 360.
+    timeout-minutes: 350
 
     steps:
       - name: Checkout code
@@ -51,9 +67,10 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        # -u so a multi-hour run streams its log instead of buffering it.
         run: |
           if [ "${{ inputs.test_email }}" = "true" ]; then
-            python check_peddocks.py --test-email
+            python -u check_peddocks.py --test-email
           else
-            python check_peddocks.py
+            python -u check_peddocks.py --watch
           fi

@@ -5,8 +5,14 @@ reports any target date where a site is bookable ("A"). Emails over SMTP
 when something opens up, remembering what it already reported so the same
 opening is not emailed twice.
 
+GitHub's `schedule` event is best-effort: under load it silently drops runs,
+and in practice only ~15% of this workflow's cron slots ever fired. So
+--watch keeps a single run polling on its own timer rather than trusting the
+scheduler to fire every check; see .github/workflows/check_peddocks.yml.
+
 Usage:
     python check_peddocks.py                      # check the target dates below
+    python check_peddocks.py --watch              # poll until the window closes
     python check_peddocks.py --dry-run            # print results, never email
     python check_peddocks.py --test-email         # send a test email, then exit
     python check_peddocks.py --dates 2026-09-19 2026-10-03
@@ -19,6 +25,8 @@ import json
 import os
 import re
 import sys
+import time
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
 
@@ -53,6 +61,13 @@ TARGET_TYPES = {"Yurt", "Tent"}
 # stays open for hours only notifies once. Persisted across CI runs by the
 # actions/cache step in .github/workflows/check_peddocks.yml.
 DEFAULT_STATE_FILE = ".peddocks_state.json"
+
+# Quiet hours for --watch. ZoneInfo tracks the EDT/EST switch, so this stays
+# right across the DST change; the cron in the workflow is only a coarse UTC
+# gate and this is the real authority on when to poll.
+WATCH_TZ = ZoneInfo("America/New_York")
+WATCH_START_HOUR = 5
+WATCH_END_HOUR = 23
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -126,38 +141,8 @@ def scrape_window(page, start_date):
     return grid
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dates", nargs="+", default=TARGET_DATES,
-                        help="YYYY-MM-DD nights to check (default: %(default)s)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="print results, never send email or save state")
-    parser.add_argument("--test-email", action="store_true",
-                        help="send a test email to prove delivery works, then exit")
-    parser.add_argument("--state", default=DEFAULT_STATE_FILE,
-                        help="file remembering already-sent alerts (default: %(default)s)")
-    parser.add_argument("--reset-state", action="store_true",
-                        help="clear remembered alerts before running")
-    args = parser.parse_args()
-
-    if args.test_email:
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        describe_email_env()
-        print("\nSending test email...")
-        send_email(
-            "Peddocks alert test -- delivery is working",
-            f"<strong>This is a test.</strong><br><br>Your Peddocks Island watcher "
-            f"can reach your inbox. Sent {now}.<br><br>Real alerts will name the "
-            f"site and date, and link to <a href='{DETAILS_URL}'>the booking page</a>.",
-        )
-        return 0
-
-    if args.reset_state and os.path.exists(args.state):
-        os.remove(args.state)
-        print(f"Cleared {args.state}")
-
-    targets = sorted(datetime.date.fromisoformat(d) for d in args.dates)
-
+def check_once(args, targets):
+    """One scrape-and-alert pass over `targets`. Returns a process exit code."""
     grid = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -244,6 +229,78 @@ def main():
         save_state(args.state, state)
         print(f"State saved to {args.state} ({len(notified)} remembered opening(s)).")
     return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dates", nargs="+", default=TARGET_DATES,
+                        help="YYYY-MM-DD nights to check (default: %(default)s)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print results, never send email or save state")
+    parser.add_argument("--test-email", action="store_true",
+                        help="send a test email to prove delivery works, then exit")
+    parser.add_argument("--state", default=DEFAULT_STATE_FILE,
+                        help="file remembering already-sent alerts (default: %(default)s)")
+    parser.add_argument("--reset-state", action="store_true",
+                        help="clear remembered alerts before running")
+    parser.add_argument("--watch", action="store_true",
+                        help="keep checking every --interval minutes until the watch "
+                             "window closes or --max-minutes is reached")
+    parser.add_argument("--interval", type=float, default=5.0,
+                        help="minutes between checks in --watch mode (default: %(default)s)")
+    parser.add_argument("--max-minutes", type=float, default=330.0,
+                        help="stop watching after this long, staying under the job "
+                             "timeout so the cache still saves (default: %(default)s)")
+    args = parser.parse_args()
+
+    if args.test_email:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        describe_email_env()
+        print("\nSending test email...")
+        send_email(
+            "Peddocks alert test -- delivery is working",
+            f"<strong>This is a test.</strong><br><br>Your Peddocks Island watcher "
+            f"can reach your inbox. Sent {now}.<br><br>Real alerts will name the "
+            f"site and date, and link to <a href='{DETAILS_URL}'>the booking page</a>.",
+        )
+        return 0
+
+    if args.reset_state and os.path.exists(args.state):
+        os.remove(args.state)
+        print(f"Cleared {args.state}")
+
+    targets = sorted(datetime.date.fromisoformat(d) for d in args.dates)
+
+    if not args.watch:
+        return check_once(args, targets)
+
+    deadline = time.monotonic() + args.max_minutes * 60
+    failures = 0
+    while True:
+        now = datetime.datetime.now(WATCH_TZ)
+        if not WATCH_START_HOUR <= now.hour < WATCH_END_HOUR:
+            print(f"\n{now:%H:%M %Z} is outside the "
+                  f"{WATCH_START_HOUR:02d}:00-{WATCH_END_HOUR:02d}:00 watch window; "
+                  "exiting.")
+            return 0
+
+        print(f"\n===== check at {now:%Y-%m-%d %H:%M:%S %Z} =====")
+        try:
+            failures = failures + 1 if check_once(args, targets) else 0
+        except Exception as exc:
+            # A blip at ReserveAmerica shouldn't end a multi-hour watch.
+            failures += 1
+            print(f"check failed: {exc}", file=sys.stderr)
+        if failures >= 3:
+            print("Three checks in a row failed; exiting so the run goes red.",
+                  file=sys.stderr)
+            return 1
+
+        if time.monotonic() + args.interval * 60 >= deadline:
+            print(f"\nHit --max-minutes ({args.max_minutes:.0f}); exiting so a queued "
+                  "run can take over.")
+            return 0
+        time.sleep(args.interval * 60)
 
 
 if __name__ == "__main__":
