@@ -82,4 +82,6 @@ def send_email(subject, html):
         ) from exc
     except Exception as exc:
         raise RuntimeError(f"SMTP send via {host}:{port} failed: {exc}") from exc
-    print(f"Email sent to {recipient} via {host}.")
+    # Not logging the recipient: run logs are public, and GitHub's secret
+    # masking is best-effort once a value has been transformed.
+    print(f"Email sent via {host}.")
